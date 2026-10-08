@@ -9,10 +9,14 @@
 #include <LibraryBuilder.h>
 #include <Logging.h>
 #include <OpdsStream.h>
+#include <PersistableStore.h>
 #include <WiFi.h>
+
+#include <algorithm>
 
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
+#include "RecentBooksStore.h"
 #include "SilentRestart.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "activities/util/KeyboardEntryActivity.h"
@@ -24,6 +28,7 @@
 #include "network/HttpDownloader.h"
 #include "util/BookCacheUtils.h"
 #include "util/OpdsFilename.h"
+#include "util/ShelfSyncPlan.h"
 #include "util/StringUtils.h"
 #include "util/UrlUtils.h"
 
@@ -36,6 +41,9 @@ constexpr fui::ActionId ACTION_CANCEL = 3;
 constexpr fui::ActionId ACTION_BACK = 4;
 constexpr int DOWNLOAD_PROGRESS_STEP_PERCENT = 5;
 constexpr unsigned long DOWNLOAD_PROGRESS_MIN_UPDATE_MS = 5000;
+// Bounds the shelf list held in RAM while syncing (one URL and path per book).
+constexpr size_t MAX_SYNC_BOOKS = 100;
+constexpr int MAX_SYNC_PAGES = 10;
 
 }  // namespace
 
@@ -84,6 +92,10 @@ void OpdsBookBrowserActivity::onExit() {
 
 void OpdsBookBrowserActivity::activateSelected() {
   if (entries.empty() || selectorIndex < 0 || selectorIndex >= static_cast<int>(entries.size())) return;
+  if (hasSyncRow && selectorIndex == 0) {
+    syncShelf();
+    return;
+  }
   const auto& entry = entries[selectorIndex];
   entry.type == OpdsEntryType::BOOK ? downloadBook(entry) : navigateToEntry(entry);
 }
@@ -115,7 +127,7 @@ void OpdsBookBrowserActivity::onBackEvent(const fui::ActionEvent&, void* user) {
 
 void OpdsBookBrowserActivity::onCancelEvent(const fui::ActionEvent&, void* user) {
   auto* self = static_cast<OpdsBookBrowserActivity*>(user);
-  if (self->state != BrowserState::DOWNLOADING) return;
+  if (self->state != BrowserState::DOWNLOADING && self->state != BrowserState::SYNCING) return;
   self->app.clearTapFlash();
   self->cancelDownload = true;
 }
@@ -150,7 +162,20 @@ void OpdsBookBrowserActivity::loop() {
     return;
   }
 
-  if (state == BrowserState::DOWNLOADING) return;
+  if (state == BrowserState::DOWNLOADING || state == BrowserState::SYNCING) return;
+
+  if (state == BrowserState::SYNC_DONE) {
+    int tx = 0;
+    int ty = 0;
+    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm) ||
+        mappedInput.wasReleased(MappedInputManager::Button::Back) || mappedInput.wasScreenTapped(tx, ty)) {
+      state = BrowserState::LOADING;
+      statusMessage = tr(STR_LOADING);
+      requestUpdate();
+      fetchFeed(currentPath);
+    }
+    return;
+  }
 
   if (state == BrowserState::BROWSING) {
     if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
@@ -210,9 +235,11 @@ bool OpdsBookBrowserActivity::preventAutoSleep() {
     case BrowserState::WIFI_SELECTION:
     case BrowserState::LOADING:
     case BrowserState::DOWNLOADING:
+    case BrowserState::SYNCING:
     case BrowserState::SEARCH_INPUT:
       return true;
     case BrowserState::BROWSING:
+    case BrowserState::SYNC_DONE:
     case BrowserState::ERROR:
       return false;
   }
@@ -227,6 +254,9 @@ void OpdsBookBrowserActivity::rootScreen(UiScreen& screen, void* user) {
       break;
     case BrowserState::DOWNLOADING:
       self->buildDownloadScreen(screen);
+      break;
+    case BrowserState::SYNCING:
+      self->syncTotal > 0 ? self->buildDownloadScreen(screen) : self->buildStatusScreen(screen);
       break;
     default:
       self->buildStatusScreen(screen);
@@ -316,7 +346,13 @@ void OpdsBookBrowserActivity::buildDownloadScreen(UiScreen& screen) {
   const fui::Rect body = screen.body();
   if (body.height > blockH) screen.spacer(static_cast<int16_t>((body.height - blockH) / 2));
 
-  screen.target().text(screen.takeTop(lh, gap), tr(STR_DOWNLOADING), centered);
+  if (state == BrowserState::SYNCING) {
+    char line[48];
+    snprintf(line, sizeof(line), "%s %d/%d", tr(STR_SYNCING_SHELF), syncIndex, syncTotal);
+    screen.target().text(screen.takeTop(lh, gap), line, centered);
+  } else {
+    screen.target().text(screen.takeTop(lh, gap), tr(STR_DOWNLOADING), centered);
+  }
   screen.target().text(screen.takeTop(lh, gap), statusMessage.c_str(), centered);
 
   const fui::Rect bar = screen.takeTop(barH, gap).inset(fui::Insets{0, 50, 0, 50});
@@ -354,6 +390,19 @@ void OpdsBookBrowserActivity::buildStatusScreen(UiScreen& screen) {
     if (showTapHint) screen.target().text(screen.takeTop(lh), tr(STR_TAP_TO_RETRY), centered);
     return;
   }
+  if (state == BrowserState::SYNC_DONE) {
+    // statusMessage holds the summary; a second line flags a partial result.
+    const int16_t lh = screen.target().lineHeight(centered.font);
+    const int16_t gap = screen.theme().spaceMd;
+    const bool hasNote = !errorMessage.empty();
+    const int16_t blockH = static_cast<int16_t>(lh * (hasNote ? 3 : 2) + gap * (hasNote ? 2 : 1));
+    const fui::Rect body = screen.body();
+    if (body.height > blockH) screen.spacer(static_cast<int16_t>((body.height - blockH) / 2));
+    screen.target().text(screen.takeTop(lh, gap), tr(STR_SHELF_SYNCED), centered);
+    screen.target().text(screen.takeTop(lh, gap), statusMessage.c_str(), centered);
+    if (hasNote) screen.target().text(screen.takeTop(lh), errorMessage.c_str(), centered);
+    return;
+  }
   // CHECK_WIFI / LOADING (and the brief child-activity handoff states).
   screen.centeredText(statusMessage.c_str(), centered);
 }
@@ -364,14 +413,20 @@ void OpdsBookBrowserActivity::render(RenderLock&&) {
   MappedInputManager::Labels labels;
   switch (state) {
     case BrowserState::BROWSING: {
-      const char* confirmLabel =
-          (!entries.empty() && entries[selectorIndex].type == OpdsEntryType::BOOK) ? tr(STR_DOWNLOAD) : tr(STR_OPEN);
+      const char* confirmLabel = (hasSyncRow && selectorIndex == 0) ? tr(STR_SYNC)
+                                 : (!entries.empty() && entries[selectorIndex].type == OpdsEntryType::BOOK)
+                                     ? tr(STR_DOWNLOAD)
+                                     : tr(STR_OPEN);
       const char* searchLabel = (!searchTemplate.empty() && selectorIndex == 0) ? tr(STR_SEARCH) : tr(STR_DIR_UP);
       labels = mappedInput.mapLabels(tr(STR_BACK), confirmLabel, searchLabel, tr(STR_DIR_DOWN));
       break;
     }
     case BrowserState::DOWNLOADING:
+    case BrowserState::SYNCING:
       labels = mappedInput.mapLabels(tr(STR_CANCEL), "", "", "");
+      break;
+    case BrowserState::SYNC_DONE:
+      labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
       break;
     case BrowserState::ERROR:
       labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_RETRY), "", "");
@@ -425,7 +480,7 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
   listNav.reset();
   entries = std::move(parser).getEntries();
 
-  entries.reserve(entries.size() + (prevUrl.empty() ? 0 : 1) + (nextUrl.empty() ? 0 : 1));
+  entries.reserve(entries.size() + (prevUrl.empty() ? 0 : 1) + (nextUrl.empty() ? 0 : 1) + 1);
   if (!prevUrl.empty()) {
     entries.insert(entries.begin(), OpdsEntry{OpdsEntryType::NAVIGATION, tr(STR_PREV_PAGE), "", prevUrl, ""});
   }
@@ -434,6 +489,13 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
   }
   if (feedTruncated) {
     LOG_INF("OPDS", "Feed truncated to fit memory");
+  }
+  // A server's root feed that lists books is a shelf the device can mirror.
+  hasSyncRow = currentPath.empty() && prevUrl.empty() &&
+               std::any_of(entries.begin(), entries.end(),
+                           [](const OpdsEntry& entry) { return entry.type == OpdsEntryType::BOOK; });
+  if (hasSyncRow) {
+    entries.insert(entries.begin(), OpdsEntry{OpdsEntryType::NAVIGATION, tr(STR_SYNC_SHELF), "", "", ""});
   }
 
   state = entries.empty() ? BrowserState::ERROR : BrowserState::BROWSING;
@@ -464,6 +526,7 @@ void OpdsBookBrowserActivity::releaseEntries() {
   closeRouting();
   std::vector<OpdsEntry>().swap(entries);
   std::vector<fui::ListItem>().swap(rowItems);
+  hasSyncRow = false;
 }
 
 void OpdsBookBrowserActivity::navigateToEntry(const OpdsEntry& entry) {
@@ -540,10 +603,7 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
   if (auto* fcm = renderer.getFontCacheManager()) {
     fcm->releaseSdFontCaches();
   }
-  LOG_DBG("OPDS", "Download heap: %u free, %u max block", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-  if (ESP.getFreeHeap() < HttpDownloader::MIN_TLS_FREE_HEAP ||
-      ESP.getMaxAllocHeap() < HttpDownloader::MIN_TLS_MAX_ALLOC) {
-    LOG_ERR("OPDS", "Low heap for download (%u free, %u max block)", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  if (!hasDownloadHeap()) {
     state = BrowserState::ERROR;
     errorMessage = tr(STR_DOWNLOAD_FAILED);
     requestUpdate();
@@ -552,33 +612,9 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
 
   int lastRenderedPercent = -1;
   unsigned long lastProgressUpdateMs = 0;
-  const auto result = HttpDownloader::downloadToFile(
-      downloadUrl, filename,
-      [this, &lastRenderedPercent, &lastProgressUpdateMs](const size_t downloaded, const size_t total) {
-        downloadProgress = downloaded;
-        downloadTotal = total;
-        // The activity loop is blocked for the whole download; pump input here
-        // so the Cancel button or a Back press can abort mid-transfer.
-        mappedInput.update(true);
-        if (mappedInput.wasReleased(MappedInputManager::Button::Back)) cancelDownload = true;
-        // Home cancels immediately; other configured actions are deferred to
-        // the next main-loop pass by the transfer input pump.
-        if (mappedInput.wasHomeGesture()) {
-          cancelDownload = true;
-          goHomeAfterCancel = true;
-        }
-        routeTouch(mappedInput);
-        const int percent = total > 0 ? static_cast<int>(static_cast<uint64_t>(downloaded) * 100 / total) : 0;
-        const unsigned long now = millis();
-        if (percent >= 100 || lastRenderedPercent < 0 ||
-            percent >= lastRenderedPercent + DOWNLOAD_PROGRESS_STEP_PERCENT ||
-            now - lastProgressUpdateMs >= DOWNLOAD_PROGRESS_MIN_UPDATE_MS) {
-          lastRenderedPercent = percent;
-          lastProgressUpdateMs = now;
-          requestUpdate(true);
-        }
-      },
-      &cancelDownload, server.username, server.password);
+  const auto result = HttpDownloader::downloadToFile(downloadUrl, filename,
+                                                     downloadProgressPump(lastRenderedPercent, lastProgressUpdateMs),
+                                                     &cancelDownload, server.username, server.password);
 
   if (result == HttpDownloader::OK) {
     clearBookCache(filename);
@@ -605,6 +641,214 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
     errorMessage = tr(STR_DOWNLOAD_FAILED);
   }
   requestUpdate();
+}
+
+void OpdsBookBrowserActivity::failSync(const char* message) {
+  state = BrowserState::ERROR;
+  errorMessage = message;
+  requestUpdate();
+}
+
+// Mirrors this server's root feed into "/<server name>": downloads books not on
+// the card and deletes books an earlier sync downloaded that have since left the
+// shelf. The managed list lives in /.crosspoint/shelfsync-<server name>.json, so
+// books put in the folder by hand are never deleted.
+void OpdsBookBrowserActivity::syncShelf() {
+  state = BrowserState::SYNCING;
+  statusMessage = tr(STR_SYNCING_SHELF);
+  syncIndex = syncTotal = 0;
+  downloadProgress = downloadTotal = 0;
+  cancelDownload = false;
+  goHomeAfterCancel = false;
+  releaseEntries();
+  requestUpdate(true);
+
+  const std::string shelfName = StringUtils::sanitizeFilename(server.name.empty() ? "OPDS Shelf" : server.name);
+  const std::string folder = "/" + shelfName;
+  const std::string manifestPath = "/.crosspoint/shelfsync-" + shelfName + ".json";
+  const auto format = static_cast<OpdsFilenameFormat>(SETTINGS.opdsFilenameFormat);
+
+  std::vector<std::string> urls;
+  std::vector<std::string> paths;
+  urls.reserve(32);
+  paths.reserve(32);
+  bool feedComplete = true;
+  std::string pageUrl = UrlUtils::buildUrl(server.url, currentPath);
+  for (int page = 0; !pageUrl.empty(); ++page) {
+    if (page >= MAX_SYNC_PAGES || urls.size() >= MAX_SYNC_BOOKS) {
+      LOG_INF("OPDS", "Shelf sync stopped at %d pages / %u books", page, static_cast<unsigned>(urls.size()));
+      feedComplete = false;
+      break;
+    }
+    OpdsParser parser;
+    {
+      OpdsParserStream stream{parser};
+      if (!HttpDownloader::fetchUrl(pageUrl, stream, server.username, server.password)) {
+        failSync(tr(STR_FETCH_FEED_FAILED));
+        return;
+      }
+    }
+    if (!parser) {
+      failSync(tr(STR_PARSE_FEED_FAILED));
+      return;
+    }
+    if (parser.truncated()) feedComplete = false;
+    for (const auto& entry : parser.getEntries()) {
+      if (entry.type != OpdsEntryType::BOOK || urls.size() >= MAX_SYNC_BOOKS) continue;
+      urls.push_back(UrlUtils::buildUrl(pageUrl, entry.href));
+      paths.push_back(folder + "/" + opdsBookFilename(entry.author, entry.title, format));
+    }
+    const std::string& next = parser.getNextPageUrl();
+    pageUrl = next.empty() ? std::string() : UrlUtils::buildUrl(pageUrl, next);
+  }
+
+  std::vector<std::string> managed;
+  {
+    JsonDocument doc;
+    if (PersistableStoreBase::readDocFromFile(manifestPath.c_str(), doc)) {
+      const JsonArrayConst files = doc["files"].as<JsonArrayConst>();
+      managed.reserve(files.size());
+      for (JsonVariantConst file : files) {
+        const char* path = file | "";
+        if (path[0] != '\0') managed.emplace_back(path);
+      }
+    }
+  }
+
+  const ShelfSyncPlan plan = planShelfSync(
+      paths, managed, feedComplete, [](const std::string& path, void*) { return Storage.exists(path.c_str()); },
+      nullptr);
+  std::vector<std::string>().swap(managed);
+  LOG_INF("OPDS", "Shelf sync: %u books, %u to download, %u to delete", static_cast<unsigned>(paths.size()),
+          static_cast<unsigned>(plan.downloads.size()), static_cast<unsigned>(plan.deletions.size()));
+
+  std::vector<std::string> nowManaged = plan.kept;
+  nowManaged.reserve(plan.kept.size() + plan.downloads.size() + plan.deletions.size());
+  int added = 0;
+  int removed = 0;
+  int failed = 0;
+  bool cancelled = false;
+
+  if (!plan.downloads.empty()) {
+    if (!Storage.exists(folder.c_str()) && !Storage.mkdir(folder.c_str())) {
+      LOG_ERR("OPDS", "mkdir failed for %s", folder.c_str());
+      failSync(tr(STR_DOWNLOAD_FAILED));
+      return;
+    }
+    if (auto* fcm = renderer.getFontCacheManager()) {
+      fcm->releaseSdFontCaches();
+    }
+    syncTotal = static_cast<int>(plan.downloads.size());
+    for (const size_t index : plan.downloads) {
+      ++syncIndex;
+      const std::string& path = paths[index];
+      statusMessage = path.substr(folder.size() + 1);
+      downloadProgress = downloadTotal = 0;
+      requestUpdate(true);
+      if (!hasDownloadHeap()) {
+        ++failed;
+        continue;
+      }
+      int lastRenderedPercent = -1;
+      unsigned long lastProgressUpdateMs = 0;
+      const auto result = HttpDownloader::downloadToFile(
+          urls[index], path, downloadProgressPump(lastRenderedPercent, lastProgressUpdateMs), &cancelDownload,
+          server.username, server.password);
+      if (result == HttpDownloader::OK) {
+        clearBookCache(path);
+        nowManaged.push_back(path);
+        ++added;
+      } else if (result == HttpDownloader::ABORTED) {
+        cancelled = true;
+        break;
+      } else {
+        LOG_ERR("OPDS", "Shelf download failed (%d): %s", static_cast<int>(result), path.c_str());
+        ++failed;
+      }
+    }
+  }
+
+  bool recentsChanged = false;
+  for (const auto& path : plan.deletions) {
+    if (cancelled) {
+      nowManaged.push_back(path);
+      continue;
+    }
+    clearBookCache(path);
+    if (Storage.remove(path.c_str())) {
+      ++removed;
+      recentsChanged = RECENT_BOOKS.removeByPath(path) || recentsChanged;
+    } else {
+      LOG_ERR("OPDS", "Shelf sync cannot delete %s", path.c_str());
+      nowManaged.push_back(path);
+      ++failed;
+    }
+  }
+  if (recentsChanged) RECENT_BOOKS.saveToFile();
+
+  {
+    JsonDocument doc;
+    JsonArray files = doc["files"].to<JsonArray>();
+    for (const auto& path : nowManaged) files.add(path.c_str());
+    if (!PersistableStoreBase::writeDocToFile(manifestPath.c_str(), doc)) {
+      LOG_ERR("OPDS", "Cannot save %s", manifestPath.c_str());
+    }
+  }
+  if (added > 0 || removed > 0) library::markLibraryIndexDirty();
+
+  if (goHomeAfterCancel) {
+    onGoHome();
+    return;
+  }
+
+  char summary[96];
+  if (failed > 0) {
+    snprintf(summary, sizeof(summary), "%s %d, %s %d, %s %d", tr(STR_SYNC_ADDED), added, tr(STR_SYNC_REMOVED), removed,
+             tr(STR_SYNC_FAILED_COUNT), failed);
+  } else {
+    snprintf(summary, sizeof(summary), "%s %d, %s %d", tr(STR_SYNC_ADDED), added, tr(STR_SYNC_REMOVED), removed);
+  }
+  statusMessage = summary;
+  errorMessage = cancelled ? tr(STR_SYNC_CANCELLED) : (feedComplete ? "" : tr(STR_SYNC_INCOMPLETE));
+  state = BrowserState::SYNC_DONE;
+  requestUpdate();
+}
+
+bool OpdsBookBrowserActivity::hasDownloadHeap() {
+  LOG_DBG("OPDS", "Download heap: %u free, %u max block", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  if (ESP.getFreeHeap() < HttpDownloader::MIN_TLS_FREE_HEAP ||
+      ESP.getMaxAllocHeap() < HttpDownloader::MIN_TLS_MAX_ALLOC) {
+    LOG_ERR("OPDS", "Low heap for download (%u free, %u max block)", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    return false;
+  }
+  return true;
+}
+
+HttpDownloader::ProgressCallback OpdsBookBrowserActivity::downloadProgressPump(int& lastRenderedPercent,
+                                                                               unsigned long& lastProgressUpdateMs) {
+  return [this, &lastRenderedPercent, &lastProgressUpdateMs](const size_t downloaded, const size_t total) {
+    downloadProgress = downloaded;
+    downloadTotal = total;
+    // The activity loop is blocked for the whole download; pump input here
+    // so the Cancel button or a Back press can abort mid-transfer.
+    mappedInput.update(true);
+    if (mappedInput.wasReleased(MappedInputManager::Button::Back)) cancelDownload = true;
+    // Home cancels immediately; other configured actions are deferred to
+    // the next main-loop pass by the transfer input pump.
+    if (mappedInput.wasHomeGesture()) {
+      cancelDownload = true;
+      goHomeAfterCancel = true;
+    }
+    routeTouch(mappedInput);
+    const int percent = total > 0 ? static_cast<int>(static_cast<uint64_t>(downloaded) * 100 / total) : 0;
+    const unsigned long now = millis();
+    if (percent >= 100 || lastRenderedPercent < 0 || percent >= lastRenderedPercent + DOWNLOAD_PROGRESS_STEP_PERCENT ||
+        now - lastProgressUpdateMs >= DOWNLOAD_PROGRESS_MIN_UPDATE_MS) {
+      lastRenderedPercent = percent;
+      lastProgressUpdateMs = now;
+      requestUpdate(true);
+    }
+  };
 }
 
 void OpdsBookBrowserActivity::launchSearch() {

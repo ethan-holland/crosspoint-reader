@@ -8,6 +8,7 @@
 #include "OpdsServerStore.h"
 #include "activities/Activity.h"
 #include "components/UiAppHost.h"
+#include "network/HttpDownloader.h"
 #include "util/ButtonNavigator.h"
 
 /**
@@ -16,7 +17,17 @@
  */
 class OpdsBookBrowserActivity final : public Activity, private UiAppHost {
  public:
-  enum class BrowserState { CHECK_WIFI, WIFI_SELECTION, LOADING, BROWSING, DOWNLOADING, ERROR, SEARCH_INPUT };
+  enum class BrowserState {
+    CHECK_WIFI,
+    WIFI_SELECTION,
+    LOADING,
+    BROWSING,
+    DOWNLOADING,
+    SYNCING,
+    SYNC_DONE,
+    ERROR,
+    SEARCH_INPUT
+  };
 
   explicit OpdsBookBrowserActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, OpdsServer server);
 
@@ -42,6 +53,12 @@ class OpdsBookBrowserActivity final : public Activity, private UiAppHost {
   std::string statusMessage;
   size_t downloadProgress = 0;
   size_t downloadTotal = 0;
+  // Shelf sync: the root feed of a server that lists books gets a sync row at
+  // index 0. syncIndex/syncTotal count downloads; syncTotal 0 = still reading
+  // the shelf.
+  bool hasSyncRow = false;
+  int syncIndex = 0;
+  int syncTotal = 0;
 
   OpdsServer server;  // Copied at construction — safe even if the store changes during browsing
 
@@ -76,6 +93,10 @@ class OpdsBookBrowserActivity final : public Activity, private UiAppHost {
   void navigateToEntry(const OpdsEntry& entry);
   void navigateBack();
   void downloadBook(const OpdsEntry& book);
+  void syncShelf();
+  void failSync(const char* message);
+  bool hasDownloadHeap();
+  HttpDownloader::ProgressCallback downloadProgressPump(int& lastRenderedPercent, unsigned long& lastProgressUpdateMs);
   void launchSearch();
   void performSearch(const std::string& query);
   bool preventAutoSleep() override;
